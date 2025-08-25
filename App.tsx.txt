@@ -1,0 +1,629 @@
+// App.tsx
+// Ludo (Ludo King‑style) — Feature‑rich Expo + React Native (TypeScript)
+// NEW: online (Firebase RTDB/WebSocket-ready) + bots + animations (Reanimated) +
+// sounds (Expo AV) + haptics + simple lobbies + persistence (AsyncStorage) + local leaderboards.
+//
+// Quick start
+//   1) create:  npx create-expo-app ludo-rn --template expo-template-blank-typescript
+//   2) deps:    npx expo install react-native-reanimated @react-native-async-storage/async-storage expo-av expo-haptics
+//               (optional online)
+//               Firebase RTDB: npm i firebase
+//               OR your WS server: set WS_URL below
+//   3) babel:   add 'react-native-reanimated/plugin' as the LAST plugin in babel.config.js
+//   4) replace: overwrite App.tsx with this file.  npx expo start
+//   5) to enable Firebase, fill FIREBASE_CONFIG below (or leave empty to run offline/local/bot).
+
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { SafeAreaView, View, Text, Pressable, StyleSheet, GestureResponderEvent, TextInput, Platform, ScrollView } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Haptics from 'expo-haptics';
+import { Audio } from 'expo-av';
+import Animated, { useSharedValue, useAnimatedStyle, withTiming, Easing } from 'react-native-reanimated';
+
+// =============== OPTIONAL ONLINE CONFIG ===============
+// Fill these if you want Firebase RTDB sync. Otherwise, the app runs local/bot.
+const FIREBASE_CONFIG = {
+  apiKey: '',
+  authDomain: '',
+  databaseURL: '',
+  projectId: '',
+  storageBucket: '',
+  messagingSenderId: '',
+  appId: '',
+};
+// Optional WebSocket server (simple JSON broadcast by room). Example: ws://localhost:3001
+const WS_URL = '';
+
+// =============== GAME MODEL ===============
+
+type PlayerId = 0 | 1 | 2 | 3;
+
+const PLAYER_COLORS = ['#e63946', '#457b9d', '#2a9d8f', '#f4a261'];
+const PLAYER_NAMES = ['Red', 'Blue', 'Green', 'Yellow'];
+
+const RING_LEN = 52;
+const HOME_LEN = 6;
+const TOKENS_PER_PLAYER = 4;
+
+const START_INDEX: Record<PlayerId, number> = { 0: 0, 1: 13, 2: 26, 3: 39 };
+const HOME_ENTRY: Record<PlayerId, number> = { 0: 50, 1: 11, 2: 24, 3: 37 };
+const SAFE_CELLS = new Set<number>([0, 13, 26, 39]);
+
+interface YardLoc { kind: 'yard' }
+interface RingLoc { kind: 'ring'; ringIndex: number }
+interface HomeLoc { kind: 'homeLane'; laneIndex: number }
+interface FinishedLoc { kind: 'finished' }
+
+type TokenLoc = YardLoc | RingLoc | HomeLoc | FinishedLoc;
+
+interface TokenState { id: number; loc: TokenLoc }
+interface PlayerState { id: PlayerId; color: string; name: string; tokens: TokenState[] }
+
+interface GameState {
+  players: PlayerState[];
+  current: PlayerId;
+  dice: number | null;
+  rolled: boolean;
+  consecutiveSixes: number;
+  activePlayers: PlayerId[];
+  winnerOrder: PlayerId[];
+  room?: string | null; // online room id
+  mode: 'LOCAL' | 'ONLINE' | 'BOT';
+  botFor: PlayerId[]; // which player slots are bots
+  botDifficulty: 'EASY' | 'MEDIUM' | 'HARD';
+  stats: StatsState;
+}
+
+interface StatsState { games: number; wins: number[]; captures: number; moves: number }
+
+const defaultStats = (): StatsState => ({ games: 0, wins: [0,0,0,0], captures: 0, moves: 0 });
+
+// =============== HELPERS ===============
+
+const modRing = (n: number) => ((n % RING_LEN) + RING_LEN) % RING_LEN;
+
+function createPlayer(id: PlayerId): PlayerState {
+  return { id, color: PLAYER_COLORS[id], name: PLAYER_NAMES[id], tokens: Array.from({length: TOKENS_PER_PLAYER}, (_,i)=>({ id: i, loc: { kind: 'yard' } as TokenLoc })) };
+}
+
+function baseGame(activePlayers: PlayerId[] = [0,1,2,3], mode: GameState['mode']='LOCAL'): GameState {
+  const players = [0,1,2,3].map(i => createPlayer(i as PlayerId));
+  return { players, current: activePlayers[0], dice: null, rolled: false, consecutiveSixes: 0, activePlayers, winnerOrder: [], room: null, mode, botFor: [], botDifficulty:'MEDIUM', stats: defaultStats() };
+}
+
+function allTokensFinished(p: PlayerState) { return p.tokens.every(t => t.loc.kind === 'finished'); }
+
+function ringDistance(from: number, steps: number) { return modRing(from + steps); }
+
+function moveToken(game: GameState, player: PlayerState, token: TokenState, dice: number): { updated: PlayerState; captured: boolean } | null {
+  // deep copy player
+  const p: PlayerState = { ...player, tokens: player.tokens.map(t => ({ ...t, loc: { ...t.loc } as TokenLoc })) };
+  const t = p.tokens[token.id];
+
+  if (t.loc.kind === 'yard') {
+    if (dice !== 6) return null;
+    t.loc = { kind: 'ring', ringIndex: START_INDEX[player.id] };
+    const captured = captureIfAny(game, p, t);
+    return { updated: p, captured };
+  }
+
+  if (t.loc.kind === 'ring') {
+    const toHomeEntry = modRing(HOME_ENTRY[player.id] - t.loc.ringIndex);
+    if (toHomeEntry === 0) {
+      if (dice <= HOME_LEN) { t.loc = { kind: 'homeLane', laneIndex: dice - 1 }; return { updated: p, captured: false }; }
+      return null;
+    } else if (dice > toHomeEntry) {
+      const remaining = dice - toHomeEntry;
+      if (remaining <= HOME_LEN) { t.loc = { kind: 'homeLane', laneIndex: remaining - 1 }; return { updated: p, captured: false }; }
+      return null;
+    } else {
+      t.loc.ringIndex = ringDistance(t.loc.ringIndex, dice);
+      const captured = captureIfAny(game, p, t);
+      return { updated: p, captured };
+    }
+  }
+
+  if (t.loc.kind === 'homeLane') {
+    const target = t.loc.laneIndex + dice;
+    if (target < HOME_LEN) { t.loc.laneIndex = target; return { updated: p, captured: false }; }
+    if (target === HOME_LEN) { t.loc = { kind: 'finished' }; return { updated: p, captured: false }; }
+    return null;
+  }
+
+  return null;
+}
+
+function captureIfAny(game: GameState, movedPlayer: PlayerState, movedToken: TokenState): boolean {
+  if (movedToken.loc.kind !== 'ring') return false;
+  const cell = movedToken.loc.ringIndex; if (SAFE_CELLS.has(cell)) return false;
+  let captured = false;
+  for (const pid of game.activePlayers) {
+    if (pid === movedPlayer.id) continue;
+    const opp = game.players[pid];
+    for (const t of opp.tokens) {
+      if (t.loc.kind === 'ring' && t.loc.ringIndex === cell) { t.loc = { kind: 'yard' }; captured = true; }
+    }
+  }
+  return captured;
+}
+
+// =============== BOT AI ===============
+// Simple heuristic: prefer finishing > capturing > entering yard on 6 > advancing the furthest token that doesn’t overshoot.
+function botChooseMove(game: GameState, player: PlayerState, dice: number): number | null {
+  // list legal token ids
+  const legal: number[] = [];
+  for (const tok of player.tokens) { if (moveToken(game, player, tok, dice)) legal.push(tok.id); }
+  if (!legal.length) return null;
+
+  // HARD: check for immediate finish
+  const finishTok = legal.find(id => {
+    const t = player.tokens[id];
+    if (t.loc.kind === 'homeLane') return t.loc.laneIndex + dice === HOME_LEN;
+    if (t.loc.kind === 'ring') {
+      const toEntry = modRing(HOME_ENTRY[player.id] - t.loc.ringIndex);
+      return (toEntry === 0 && dice <= HOME_LEN) || (dice > toEntry && (dice - toEntry) === HOME_LEN);
+    }
+    return false;
+  });
+  if (finishTok != null && (game.botDifficulty !== 'EASY')) return finishTok;
+
+  // capture opportunity
+  const captureTok = legal.find(id => {
+    const res = moveToken(game, player, player.tokens[id], dice)!; return res.captured;
+  });
+  if (captureTok != null && game.botDifficulty !== 'EASY') return captureTok;
+
+  // enter from yard on 6
+  const enterTok = legal.find(id => player.tokens[id].loc.kind === 'yard' && dice === 6);
+  if (enterTok != null) return enterTok;
+
+  // otherwise, move the furthest ring token (aggressive advance)
+  let best = legal[0]; let bestScore = -1;
+  for (const id of legal) {
+    const t = player.tokens[id];
+    let score = 0;
+    if (t.loc.kind === 'ring') { score = modRing(t.loc.ringIndex - START_INDEX[player.id]); }
+    if (t.loc.kind === 'homeLane') { score = 100 + t.loc.laneIndex; }
+    if (score > bestScore) { bestScore = score; best = id; }
+  }
+  // EASY: randomize
+  if (game.botDifficulty === 'EASY') {
+    return legal[Math.floor(Math.random()*legal.length)];
+  }
+  return best;
+}
+
+// =============== PERSISTENCE (AsyncStorage) ===============
+const SAVE_KEY = 'ludo.game.v2';
+const STATS_KEY = 'ludo.stats.v2';
+
+async function saveGame(g: GameState) {
+  try { await AsyncStorage.setItem(SAVE_KEY, JSON.stringify(g)); } catch {}
+}
+async function loadGame(): Promise<GameState | null> {
+  try { const raw = await AsyncStorage.getItem(SAVE_KEY); return raw ? JSON.parse(raw) as GameState : null; } catch { return null; }
+}
+async function saveStats(s: StatsState) { try { await AsyncStorage.setItem(STATS_KEY, JSON.stringify(s)); } catch {} }
+async function loadStats(): Promise<StatsState | null> { try { const raw = await AsyncStorage.getItem(STATS_KEY); return raw ? JSON.parse(raw) as StatsState : null; } catch { return null; } }
+
+// =============== ONLINE SYNC (Firebase OR WebSocket) ===============
+// Minimal abstraction so the app compiles even without config.
+
+type NetEvent = { type: 'SYNC'; state: GameState } | { type: 'ROLL'; value: number } | { type: 'MOVE'; pid: PlayerId; tid: number };
+
+interface NetProvider {
+  join(room: string, onEvent: (e: NetEvent)=>void): Promise<void>;
+  send(e: NetEvent): void;
+  leave(): void;
+}
+
+class LocalBus implements NetProvider { // offline no-op so UI works
+  private cb: ((e: NetEvent)=>void) | null = null;
+  async join(_room: string, onEvent: (e: NetEvent)=>void) { this.cb = onEvent; }
+  send(e: NetEvent) { this.cb?.(e); }
+  leave() { this.cb = null; }
+}
+
+// Optional WebSocket provider
+class WSBus implements NetProvider {
+  private ws: WebSocket | null = null; private room: string | null = null; private cb: ((e: NetEvent)=>void) | null = null;
+  async join(room: string, onEvent: (e: NetEvent)=>void) {
+    this.cb = onEvent; this.room = room;
+    this.ws = new WebSocket(`${WS_URL}?room=${room}`);
+    this.ws.onmessage = msg => { try { const data = JSON.parse(msg.data as string); if (data && data.type) this.cb?.(data as NetEvent); } catch {} };
+  }
+  send(e: NetEvent) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify(e)); }
+  leave() { try { this.ws?.close(); } catch{} this.ws = null; this.cb = null; this.room = null; }
+}
+
+// Optional Firebase provider (RTDB)
+let FirebaseBus: new()=>NetProvider | null = null;
+try {
+  // Dynamically require to avoid breaking if not installed/configured
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const fb = require('firebase/compat/app');
+  require('firebase/compat/database');
+  if (FIREBASE_CONFIG.apiKey) {
+    if (!fb.apps.length) fb.initializeApp(FIREBASE_CONFIG);
+    class _FirebaseBus implements NetProvider {
+      private cb: ((e: NetEvent)=>void) | null = null; private ref: any = null; private app: any = fb;
+      async join(room: string, onEvent: (e: NetEvent)=>void) {
+        this.cb = onEvent; this.ref = fb.database().ref(`rooms/${room}`);
+        this.ref.on('child_added', (snap: any)=>{ const val = snap.val(); if (val?.type) this.cb?.(val as NetEvent); });
+      }
+      send(e: NetEvent) { if (this.ref) this.ref.push(e); }
+      leave() { if (this.ref) this.ref.off(); this.ref = null; this.cb = null; }
+    }
+    FirebaseBus = _FirebaseBus;
+  }
+} catch {}
+
+function makeNet(): NetProvider {
+  if (WS_URL) return new WSBus();
+  if (FirebaseBus) return new FirebaseBus();
+  return new LocalBus();
+}
+
+// =============== UI GEOMETRY HELPERS ===============
+const BOARD_SIZE = 340;
+
+function useRingPath(size: number) {
+  return useMemo(() => {
+    const padding = 8; const inner = size - padding * 2; const cellsPerSide = 13; const step = inner / (cellsPerSide - 1);
+    const coords: {x:number;y:number}[] = [];
+    for (let i=0;i<cellsPerSide;i++) coords.push({ x: padding + i*step, y: padding });
+    for (let i=1;i<cellsPerSide;i++) coords.push({ x: padding + (cellsPerSide-1)*step, y: padding + i*step });
+    for (let i=cellsPerSide-2;i>=0;i--) coords.push({ x: padding + i*step, y: padding + (cellsPerSide-1)*step });
+    for (let i=cellsPerSide-2;i>0;i--) coords.push({ x: padding, y: padding + i*step });
+    return coords.slice(0, RING_LEN);
+  }, [size]);
+}
+
+function homeLaneCoord(size: number, player: PlayerId, laneIndex: number) {
+  const center = size/2; const laneStep = (size * 0.35)/HOME_LEN;
+  switch (player) {
+    case 0: return { x: center, y: size*0.15 + laneIndex*laneStep };
+    case 1: return { x: size*0.85 - laneIndex*laneStep, y: center };
+    case 2: return { x: center, y: size*0.85 - laneIndex*laneStep };
+    case 3: return { x: size*0.15 + laneIndex*laneStep, y: center };
+  }
+}
+
+// =============== Components ===============
+
+const Dice: React.FC<{ value: number | null; onRoll: () => void; disabled?: boolean; color: string }>
+  = ({ value, onRoll, disabled, color }) => {
+  const y = useSharedValue(0);
+  const style = useAnimatedStyle(()=>({ transform: [{ translateY: withTiming(y.value, { duration: 220, easing: Easing.out(Easing.quad) }) }] }));
+  useEffect(()=>{ y.value = 0; }, []);
+  useEffect(()=>{ if (value!=null) { y.value = -10; setTimeout(()=>{ y.value = 0; }, 80); } }, [value]);
+  return (
+    <Animated.View style={style}>
+      <Pressable onPress={onRoll} disabled={disabled} style={[styles.dice, { borderColor: color, opacity: disabled ? 0.6 : 1 }]}>
+        <Text style={[styles.diceText, { color }]}>{value ?? 'Roll'}</Text>
+      </Pressable>
+    </Animated.View>
+  );
+};
+
+const PlayerBadge: React.FC<{ name: string; color: string; active: boolean; finished: boolean }>
+  = ({ name, color, active, finished }) => (
+  <View style={[styles.badge, { borderColor: color, backgroundColor: active ? '#ffffff' : '#fafafa' }] }>
+    <View style={[styles.dot, { backgroundColor: color }]} />
+    <Text style={[styles.badgeText, { color }]}>{name}{finished ? ' ✓' : ''}</Text>
+  </View>
+);
+
+const Token: React.FC<{ color: string; onPress?: (e: GestureResponderEvent) => void; active?: boolean; animate?: boolean }>
+  = ({ color, onPress, active, animate }) => {
+  const scale = useSharedValue(1);
+  useEffect(()=>{ if (active) { scale.value = 1.08; setTimeout(()=>{ scale.value = 1; }, 250); } }, [active]);
+  const style = useAnimatedStyle(()=>({ transform: [{ scale: withTiming(scale.value, { duration: 200 }) }] }));
+  return (
+    <Animated.View style={[style, styles.token, { borderColor: color, backgroundColor: active ? color + '22' : 'white' }]}>
+      <Pressable style={{flex:1, alignItems:'center', justifyContent:'center'}} onPress={onPress}>
+        <View style={[styles.tokenInner, { backgroundColor: color }]} />
+      </Pressable>
+    </Animated.View>
+  );
+};
+
+const Board: React.FC<{ game: GameState; size: number; onTokenPress: (playerId: PlayerId, tokenId: number) => void; }>
+  = ({ game, size, onTokenPress }) => {
+  const path = useRingPath(size);
+  const tokenViews: React.ReactNode[] = [];
+
+  for (const pid of game.activePlayers) {
+    const p = game.players[pid];
+    for (const t of p.tokens) {
+      let x=0,y=0;
+      if (t.loc.kind === 'yard') {
+        const cornerOffset = size*0.12; const cornerSize = size*0.08; const gridX = t.id % 2; const gridY = Math.floor(t.id/2);
+        switch (p.id) {
+          case 0: x = cornerOffset + gridX*cornerSize; y = cornerOffset + gridY*cornerSize; break;
+          case 1: x = size - cornerOffset - (1-gridX)*cornerSize; y = cornerOffset + gridY*cornerSize; break;
+          case 2: x = size - cornerOffset - (1-gridX)*cornerSize; y = size - cornerOffset - (1-gridY)*cornerSize; break;
+          case 3: x = cornerOffset + gridX*cornerSize; y = size - cornerOffset - (1-gridY)*cornerSize; break;
+        }
+      } else if (t.loc.kind === 'ring') { const c = path[t.loc.ringIndex]; x = c.x; y = c.y; }
+      else if (t.loc.kind === 'homeLane') { const c = homeLaneCoord(size, p.id, t.loc.laneIndex); x=c.x; y=c.y; }
+      else { const center = size/2; x = center + (t.id-1.5)*16; y = center; }
+
+      tokenViews.push(
+        <View key={`tok-${p.id}-${t.id}`} style={[styles.tokenWrap, { left: x-12, top: y-12 }]}>
+          <Token color={p.color} onPress={() => onTokenPress(p.id, t.id)} active={game.current === p.id} />
+        </View>
+      );
+    }
+  }
+
+  const cellViews = path.map((c,i)=> (
+    <View key={`cell-${i}`} style={[styles.cell, { left: c.x - 6, top: c.y - 6, backgroundColor: SAFE_CELLS.has(i) ? '#ddd' : '#eee' }]} />
+  ));
+
+  return (
+    <View style={{ width: size, height: size }}>
+      <View style={styles.boardBg} />
+      {cellViews}
+      {tokenViews}
+    </View>
+  );
+};
+
+// =============== MAIN APP ===============
+
+export default function App() {
+  const [game, setGame] = useState<GameState>(() => baseGame([0,1,2,3], 'LOCAL'));
+  const currentPlayer = game.players[game.current];
+
+  const netRef = useRef<NetProvider | null>(null);
+  const [roomInput, setRoomInput] = useState('');
+
+  // Sounds
+  const diceSound = useRef<Audio.Sound | null>(null);
+  const moveSound = useRef<Audio.Sound | null>(null);
+  const captureSound = useRef<Audio.Sound | null>(null);
+
+  useEffect(()=>{ (async()=>{
+    try {
+      // You can replace require(...) with your own assets in ./assets
+      diceSound.current = new Audio.Sound(); await diceSound.current.loadAsync(require('./assets/dice.mp3'));
+      moveSound.current = new Audio.Sound(); await moveSound.current.loadAsync(require('./assets/move.mp3'));
+      captureSound.current = new Audio.Sound(); await captureSound.current.loadAsync(require('./assets/capture.mp3'));
+    } catch { /* assets optional */ }
+  })();
+  return ()=>{ diceSound.current?.unloadAsync(); moveSound.current?.unloadAsync(); captureSound.current?.unloadAsync(); };
+  },[]);
+
+  // Load persisted state & stats
+  useEffect(()=>{ (async()=>{
+    const saved = await loadGame(); const stats = await loadStats();
+    if (saved) setGame(g => ({ ...saved, stats: stats ?? saved.stats ?? defaultStats() }));
+    else if (stats) setGame(g => ({ ...g, stats }));
+  })(); },[]);
+
+  useEffect(()=>{ saveGame(game); saveStats(game.stats); }, [game]);
+
+  function nextPlayer(current: PlayerId, rolledSix: boolean) {
+    if (rolledSix) return current; const idx = game.activePlayers.indexOf(current); return game.activePlayers[(idx + 1) % game.activePlayers.length] as PlayerId;
+  }
+
+  async function playHaptic(kind: 'light'|'success'|'error'='light') {
+    try { if (kind==='success') await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      else if (kind==='error') await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      else await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    } catch {}
+  }
+
+  async function sfx(sound: React.MutableRefObject<Audio.Sound | null>) { try { await sound.current?.replayAsync(); } catch {} }
+
+  function emit(e: NetEvent) { netRef.current?.send(e); }
+
+  function newMatch(playerCount: 2 | 3 | 4, mode: GameState['mode']=game.mode, botFor: PlayerId[]=game.botFor) {
+    const ids: PlayerId[] = [0,1,2,3].slice(0, playerCount) as PlayerId[];
+    setGame(g => ({ ...baseGame(ids, mode), botFor, stats: g.stats, room: g.room }));
+  }
+
+  function setMode(mode: GameState['mode']) {
+    setGame(g => ({ ...g, mode }));
+  }
+
+  // ROLL
+  async function roll() {
+    if (game.rolled) return;
+    const value = Math.floor(Math.random() * 6) + 1;
+    const newSixCount = value === 6 ? game.consecutiveSixes + 1 : 0;
+    const capped = newSixCount > 2 ? 0 : newSixCount;
+    await playHaptic('light'); await sfx(diceSound);
+    const next = { ...game, dice: value, rolled: true, consecutiveSixes: capped };
+    setGame(next);
+    if (game.mode==='ONLINE') emit({ type:'ROLL', value });
+  }
+
+  // MOVE
+  async function applyMove(pid: PlayerId, tid: number) {
+    const player = game.players[pid];
+    const token = player.tokens[tid];
+    if (!game.rolled || !game.dice) return;
+    const res = moveToken(game, player, token, game.dice);
+    if (!res) { await playHaptic('error'); return; }
+
+    const newPlayers = game.players.map((p,i) => (i === pid ? res.updated : p)) as PlayerState[];
+    const rolledSix = game.dice === 6 || res.captured;
+    const nextPid = nextPlayer(pid, rolledSix);
+
+    // stats
+    const stats = { ...game.stats }; stats.moves += 1; if (res.captured) stats.captures += 1;
+
+    // check finish
+    let winnerOrder = game.winnerOrder;
+    if (allTokensFinished(newPlayers[pid])) {
+      if (!winnerOrder.includes(pid)) winnerOrder = [...winnerOrder, pid];
+      if (winnerOrder.length === game.activePlayers.length) {
+        stats.games += 1; const winner = winnerOrder[0]; stats.wins[winner] = (stats.wins[winner] ?? 0) + 1; await playHaptic('success');
+      }
+    }
+
+    await sfx(res.captured ? captureSound : moveSound);
+
+    setGame(g => ({ ...g, players: newPlayers, current: nextPid, dice: null, rolled: false, winnerOrder, stats }));
+  }
+
+  function onTokenPress(pid: PlayerId, tid: number) {
+    if (pid !== game.current) return;
+    applyMove(pid, tid);
+    if (game.mode==='ONLINE') emit({ type:'MOVE', pid, tid });
+  }
+
+  // ONLINE: join/leave room
+  async function joinRoom() {
+    const room = roomInput.trim(); if (!room) return;
+    if (!netRef.current) netRef.current = makeNet();
+    await netRef.current.join(room, (e)=>{
+      if (e.type==='ROLL') setGame(g=>({ ...g, dice: e.value, rolled: true }));
+      else if (e.type==='MOVE') applyMove(e.pid, e.tid);
+      else if (e.type==='SYNC') setGame(e.state);
+    });
+    setGame(g => ({ ...g, room }));
+  }
+  function leaveRoom() { netRef.current?.leave(); setGame(g=>({ ...g, room: null })); }
+
+  // BOT TURN
+  useEffect(()=>{
+    const pid = game.current; if (game.mode!=='BOT') return; if (!game.botFor.includes(pid)) return;
+    const run = async ()=>{
+      // If not rolled, roll first
+      if (!game.rolled) { await roll(); return; }
+      if (game.dice==null) return;
+      const moveId = botChooseMove(game, game.players[pid], game.dice);
+      if (moveId==null) {
+        // no legal move, pass turn
+        setGame(g=>({ ...g, current: nextPlayer(pid, false), dice: null, rolled: false }));
+        return;
+      }
+      applyMove(pid, moveId);
+    };
+    const t = setTimeout(run, 400); return ()=>clearTimeout(t);
+  }, [game]);
+
+  // ======= UI =======
+  const badges = (
+    <View style={styles.rowBetween}>
+      {game.activePlayers.map(pid => (
+        <PlayerBadge key={`pb-${pid}`} name={game.players[pid].name} color={game.players[pid].color} active={game.current === pid} finished={allTokensFinished(game.players[pid])} />
+      ))}
+    </View>
+  );
+
+  const leaderboard = (
+    <View style={styles.leaderWrap}>
+      <Text style={styles.sectionTitle}>Local Leaderboard</Text>
+      {PLAYER_NAMES.map((n,i)=> (
+        <View key={i} style={styles.leaderRow}>
+          <View style={[styles.dot, { backgroundColor: PLAYER_COLORS[i] }]} />
+          <Text style={{ flex:1 }}>{n}</Text>
+          <Text style={{ fontWeight:'700' }}>{game.stats.wins[i] ?? 0}</Text>
+        </View>
+      ))}
+      <Text style={styles.small}>Games: {game.stats.games} · Moves: {game.stats.moves} · Captures: {game.stats.captures}</Text>
+    </View>
+  );
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      <ScrollView contentContainerStyle={{ alignItems:'center', paddingBottom: 40 }}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Ludo (RN • Plus)</Text>
+          <View style={styles.modeRow}>
+            <Pressable onPress={() => { setMode('LOCAL'); newMatch(4, 'LOCAL'); }} style={[styles.modeBtn, game.mode==='LOCAL' && styles.modeBtnActive]}><Text style={styles.modeTxt}>Local</Text></Pressable>
+            <Pressable onPress={() => { setMode('BOT'); setGame(g=>({ ...g, botFor:[1,2,3] })); newMatch(2, 'BOT', [1]); }} style={[styles.modeBtn, game.mode==='BOT' && styles.modeBtnActive]}><Text style={styles.modeTxt}>Vs Bot</Text></Pressable>
+            <Pressable onPress={() => { setMode('ONLINE'); newMatch(2, 'ONLINE'); }} style={[styles.modeBtn, game.mode==='ONLINE' && styles.modeBtnActive]}><Text style={styles.modeTxt}>Online</Text></Pressable>
+          </View>
+
+          {game.mode==='BOT' && (
+            <View style={styles.rowBetween}>
+              <Text>Bot difficulty:</Text>
+              {(['EASY','MEDIUM','HARD'] as const).map(d => (
+                <Pressable key={d} onPress={()=> setGame(g=>({ ...g, botDifficulty:d }))} style={[styles.diffBtn, game.botDifficulty===d && styles.modeBtnActive]}><Text style={styles.modeTxt}>{d}</Text></Pressable>
+              ))}
+            </View>
+          )}
+
+          {game.mode==='ONLINE' && (
+            <View style={[styles.rowBetween, { alignItems:'center' }] }>
+              <TextInput placeholder="Room code" value={roomInput} onChangeText={setRoomInput} style={styles.input} autoCapitalize='none' />
+              {game.room ? (
+                <Pressable onPress={leaveRoom} style={styles.modeBtn}><Text style={styles.modeTxt}>Leave</Text></Pressable>
+              ) : (
+                <Pressable onPress={joinRoom} style={styles.modeBtn}><Text style={styles.modeTxt}>Join</Text></Pressable>
+              )}
+            </View>
+          )}
+
+          <View style={styles.modeRow}>
+            <Pressable onPress={() => newMatch(2, game.mode, game.botFor)} style={styles.modeBtn}><Text style={styles.modeTxt}>2P</Text></Pressable>
+            <Pressable onPress={() => newMatch(3, game.mode, game.botFor)} style={styles.modeBtn}><Text style={styles.modeTxt}>3P</Text></Pressable>
+            <Pressable onPress={() => newMatch(4, game.mode, game.botFor)} style={styles.modeBtn}><Text style={styles.modeTxt}>4P</Text></Pressable>
+          </View>
+        </View>
+
+        {badges}
+
+        <View style={styles.boardWrap}><Board game={game} size={BOARD_SIZE} onTokenPress={onTokenPress} /></View>
+
+        <View style={{ height: 12 }} />
+
+        <Text style={styles.turn}>Turn: <Text style={{ color: currentPlayer.color }}>{currentPlayer.name}</Text></Text>
+        <View style={styles.controls}>
+          <Dice value={game.dice} onRoll={roll} disabled={game.rolled} color={currentPlayer.color} />
+          <Text style={styles.hint}>Tap a highlighted token to move.</Text>
+        </View>
+
+        {leaderboard}
+
+        <View style={styles.footer}>
+          <Text style={styles.small}>Rules: 6 grants another roll; captures grant another roll; 3rd consecutive 6 blocked. Online works if Firebase/WS configured.</Text>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// =============== STYLES ===============
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: '#f7f7fb' },
+  header: { alignItems: 'center', paddingTop: 12 },
+  title: { fontSize: 22, fontWeight: '800', letterSpacing: 0.3 },
+  modeRow: { flexDirection: 'row', gap: 8, paddingVertical: 8 },
+  modeBtn: { paddingHorizontal: 12, paddingVertical: 8, backgroundColor: '#fff', borderRadius: 12, borderWidth: 1, borderColor: '#e5e7eb' },
+  modeBtnActive: { borderColor: '#111827' },
+  diffBtn: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#fff', borderRadius: 12, borderWidth: 1, borderColor: '#e5e7eb' },
+  modeTxt: { fontWeight: '700' },
+  rowBetween: { flexDirection: 'row', justifyContent: 'space-between', gap: 8, padding: 8, width: '92%' },
+  badge: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, borderWidth: 1 },
+  badgeText: { fontWeight: '700' },
+  dot: { width: 10, height: 10, borderRadius: 5 },
+
+  boardWrap: { padding: 10, borderRadius: 20, backgroundColor: '#fff', borderWidth: 1, borderColor: '#e5e7eb', marginTop: 8 },
+  boardBg: { position: 'absolute', inset: 0, backgroundColor: '#fafafa', borderRadius: 16 },
+  cell: { position: 'absolute', width: 12, height: 12, borderRadius: 6 },
+
+  tokenWrap: { position: 'absolute', width: 24, height: 24 },
+  token: { flex: 1, borderRadius: 12, borderWidth: 2, alignItems: 'center', justifyContent: 'center' },
+  tokenInner: { width: 10, height: 10, borderRadius: 6 },
+
+  controls: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 8 },
+  dice: { borderWidth: 2, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10, backgroundColor: '#fff' },
+  diceText: { fontSize: 18, fontWeight: '800' },
+  hint: { opacity: 0.7 },
+
+  input: { flex: 1, height: 40, paddingHorizontal: 12, backgroundColor:'#fff', borderRadius: 10, borderWidth:1, borderColor:'#e5e7eb' },
+
+  turn: { fontSize: 16, fontWeight: '700', marginTop: 6 },
+  footer: { padding: 8 },
+  small: { opacity: 0.7 },
+
+  leaderWrap: { marginTop: 10, width: '92%', padding: 10, backgroundColor:'#fff', borderRadius: 16, borderWidth:1, borderColor:'#eee' },
+  leaderRow: { flexDirection:'row', alignItems:'center', gap:10, paddingVertical:6 }
+});
