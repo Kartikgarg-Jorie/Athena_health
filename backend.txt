@@ -1,0 +1,489 @@
+# =============================
+# Ludo Backend (Spring Boot, WebSocket STOMP + REST)
+# Project layout (copy these files into a new Maven project)
+# =============================
+
+# ---------- pom.xml ----------
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>ludo-backend</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  <name>ludo-backend</name>
+  <properties>
+    <java.version>17</java.version>
+    <spring-boot.version>3.3.2</spring-boot.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-websocket</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <!-- Optional persistence: swap to JPA + DB later; for now we use in-memory store -->
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <configuration>
+          <excludes>
+            <exclude>
+              <groupId>org.projectlombok</groupId>
+              <artifactId>lombok</artifactId>
+            </exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <source>${java.version}</source>
+          <target>${java.version}</target>
+          <compilerArgs>
+            <arg>-parameters</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+# ---------- src/main/resources/application.yml ----------
+server:
+  port: 8080
+spring:
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+cors:
+  allowed-origins: "*"     # tighten in production
+  allowed-methods: "GET,POST,PUT,DELETE,OPTIONS"
+  allowed-headers: "*"
+
+# ---------- src/main/java/com/example/ludo/LudoApplication.java ----------
+package com.example.ludo;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class LudoApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(LudoApplication.class, args);
+    }
+}
+
+# ---------- src/main/java/com/example/ludo/config/WebSocketConfig.java ----------
+package com.example.ludo.config;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        config.enableSimpleBroker("/topic");                 // broadcast topics
+        config.setApplicationDestinationPrefixes("/app");     // client sends to /app/**
+        config.setUserDestinationPrefix("/user");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                .setAllowedOriginPatterns("*")
+                .withSockJS(); // SockJS fallback; you can remove if native WS only
+    }
+}
+
+# ---------- src/main/java/com/example/ludo/config/CorsConfig.java ----------
+package com.example.ludo.config;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.web.filter.CorsFilter;
+
+@Configuration
+public class CorsConfig {
+    @Value("${cors.allowed-origins:*")}
+    private String allowedOrigins;
+
+    @Bean
+    public CorsFilter corsFilter() {
+        CorsConfiguration config = new CorsConfiguration();
+        config.addAllowedOriginPattern(allowedOrigins);
+        config.addAllowedHeader("*");
+        config.addAllowedMethod("*");
+        config.setAllowCredentials(false);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        return new CorsFilter(source);
+    }
+}
+
+# ---------- src/main/java/com/example/ludo/model/Types.java ----------
+package com.example.ludo.model;
+
+import java.util.*;
+
+public class Types {
+    public enum PlayerId { P0, P1, P2, P3 }
+    public enum LocKind { YARD, RING, HOMELANE, FINISHED }
+
+    public static final int RING_LEN = 52;
+    public static final int HOME_LEN = 6;
+    public static final int TOKENS_PER_PLAYER = 4;
+
+    public static final Map<PlayerId, Integer> START_INDEX = Map.of(
+            PlayerId.P0, 0,
+            PlayerId.P1, 13,
+            PlayerId.P2, 26,
+            PlayerId.P3, 39
+    );
+    public static final Map<PlayerId, Integer> HOME_ENTRY = Map.of(
+            PlayerId.P0, 50,
+            PlayerId.P1, 11,
+            PlayerId.P2, 24,
+            PlayerId.P3, 37
+    );
+    public static final Set<Integer> SAFE_CELLS = Set.of(0,13,26,39);
+
+    public static int modRing(int n) { int m = n % RING_LEN; return m < 0 ? m + RING_LEN : m; }
+}
+
+# ---------- src/main/java/com/example/ludo/model/Dto.java ----------
+package com.example.ludo.model;
+
+import java.util.*;
+
+public class Dto {
+    // Token location
+    public static abstract class TokenLoc { public Types.LocKind kind; }
+    public static class YardLoc extends TokenLoc { public YardLoc(){ this.kind = Types.LocKind.YARD; } }
+    public static class RingLoc extends TokenLoc { public int ringIndex; public RingLoc(int r){ this.kind= Types.LocKind.RING; this.ringIndex=r; } }
+    public static class HomeLoc extends TokenLoc { public int laneIndex; public HomeLoc(int i){ this.kind= Types.LocKind.HOMELANE; this.laneIndex=i; } }
+    public static class FinishedLoc extends TokenLoc { public FinishedLoc(){ this.kind= Types.LocKind.FINISHED; } }
+
+    public static class TokenState { public int id; public TokenLoc loc; }
+    public static class PlayerState { public Types.PlayerId id; public String name; public String color; public List<TokenState> tokens = new ArrayList<>(); }
+
+    public static class Stats {
+        public int games; public int[] wins = new int[]{0,0,0,0}; public int captures; public int moves;
+    }
+
+    public static class GameState {
+        public List<PlayerState> players = new ArrayList<>();
+        public Types.PlayerId current; public Integer dice; public boolean rolled; public int consecutiveSixes; public List<Types.PlayerId> activePlayers = new ArrayList<>();
+        public List<Types.PlayerId> winnerOrder = new ArrayList<>(); public String room; public String mode; public List<Types.PlayerId> botFor = new ArrayList<>(); public String botDifficulty = "MEDIUM";
+        public Stats stats = new Stats();
+    }
+
+    public static class NetEvent {
+        public String type; // SYNC, ROLL, MOVE
+        public GameState state; public Integer value; public Types.PlayerId pid; public Integer tid;
+    }
+
+    public static class MoveRequest {
+        public String roomId; public Types.PlayerId pid; public Integer tid; public Integer dice; // used by server
+    }
+
+    public static class RoomInfo { public String id; public int players; public boolean inProgress; }
+}
+
+# ---------- src/main/java/com/example/ludo/service/GameService.java ----------
+package com.example.ludo.service;
+
+import com.example.ludo.model.Dto;
+import com.example.ludo.model.Types;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+import static com.example.ludo.model.Types.*;
+
+@Service
+public class GameService {
+    // In-memory room -> game state; replace with Redis/DB for production
+    private final Map<String, Dto.GameState> rooms = new ConcurrentHashMap<>();
+
+    public Dto.GameState createOrGetRoom(String roomId, int players) {
+        return rooms.computeIfAbsent(roomId, id -> baseGame(players));
+    }
+
+    public Optional<Dto.GameState> getRoom(String roomId) { return Optional.ofNullable(rooms.get(roomId)); }
+
+    public Dto.GameState baseGame(int playerCount) {
+        Dto.GameState g = new Dto.GameState();
+        for (int i = 0; i < 4; i++) {
+            Dto.PlayerState p = new Dto.PlayerState();
+            p.id = Types.PlayerId.values()[i];
+            p.name = List.of("Red","Blue","Green","Yellow").get(i);
+            p.color = List.of("#e63946","#457b9d","#2a9d8f","#f4a261").get(i);
+            for (int t=0;t<TOKENS_PER_PLAYER;t++) { Dto.TokenState ts = new Dto.TokenState(); ts.id=t; ts.loc = new Dto.YardLoc(); p.tokens.add(ts); }
+            g.players.add(p);
+        }
+        g.activePlayers = new ArrayList<>(List.of(PlayerId.P0, PlayerId.P1, PlayerId.P2, PlayerId.P3).subList(0, playerCount));
+        g.current = g.activePlayers.get(0);
+        g.mode = "ONLINE"; g.room = null; g.dice = null; g.rolled = false; g.consecutiveSixes = 0;
+        return g;
+    }
+
+    public boolean allTokensFinished(Dto.PlayerState p) {
+        return p.tokens.stream().allMatch(t -> t.loc instanceof Dto.FinishedLoc);
+    }
+
+    private int ringDistance(int from, int steps) { return Types.modRing(from + steps); }
+
+    private boolean captureIfAny(Dto.GameState game, Dto.PlayerState movedPlayer, Dto.TokenState movedToken) {
+        if (!(movedToken.loc instanceof Dto.RingLoc rl)) return false;
+        int cell = rl.ringIndex; if (SAFE_CELLS.contains(cell)) return false;
+        boolean captured = false;
+        for (Types.PlayerId pid : game.activePlayers) {
+            if (pid == movedPlayer.id) continue;
+            Dto.PlayerState opp = game.players.get(pid.ordinal());
+            for (Dto.TokenState t : opp.tokens) {
+                if (t.loc instanceof Dto.RingLoc orl && orl.ringIndex == cell) {
+                    t.loc = new Dto.YardLoc(); captured = true;
+                }
+            }
+        }
+        return captured;
+    }
+
+    public Optional<MoveResult> tryMove(Dto.GameState game, Types.PlayerId pid, int tid, int dice) {
+        Dto.PlayerState player = game.players.get(pid.ordinal());
+        Dto.TokenState token = player.tokens.get(tid);
+        if (game.current != pid) return Optional.empty();
+
+        // deep copy player for simulation
+        Dto.PlayerState p = new Dto.PlayerState();
+        p.id = player.id; p.name = player.name; p.color = player.color;
+        for (Dto.TokenState t : player.tokens) { Dto.TokenState nt = new Dto.TokenState(); nt.id = t.id; nt.loc = cloneLoc(t.loc); p.tokens.add(nt); }
+        Dto.TokenState simTok = p.tokens.get(token.id);
+
+        boolean captured = false;
+        if (simTok.loc instanceof Dto.YardLoc) {
+            if (dice != 6) return Optional.empty();
+            simTok.loc = new Dto.RingLoc(START_INDEX.get(player.id));
+            captured = captureIfAny(game, p, simTok);
+        } else if (simTok.loc instanceof Dto.RingLoc rl) {
+            int toHomeEntry = Types.modRing(HOME_ENTRY.get(player.id) - rl.ringIndex);
+            if (toHomeEntry == 0) {
+                if (dice <= HOME_LEN) simTok.loc = new Dto.HomeLoc(dice - 1); else return Optional.empty();
+            } else if (dice > toHomeEntry) {
+                int remaining = dice - toHomeEntry;
+                if (remaining <= HOME_LEN) simTok.loc = new Dto.HomeLoc(remaining - 1); else return Optional.empty();
+            } else {
+                rl.ringIndex = ringDistance(rl.ringIndex, dice);
+                captured = captureIfAny(game, p, simTok);
+            }
+        } else if (simTok.loc instanceof Dto.HomeLoc hl) {
+            int target = hl.laneIndex + dice;
+            if (target < HOME_LEN) hl.laneIndex = target; else if (target == HOME_LEN) simTok.loc = new Dto.FinishedLoc(); else return Optional.empty();
+        } else { return Optional.empty(); }
+
+        return Optional.of(new MoveResult(p, captured));
+    }
+
+    private Dto.TokenLoc cloneLoc(Dto.TokenLoc loc) {
+        if (loc instanceof Dto.YardLoc) return new Dto.YardLoc();
+        if (loc instanceof Dto.RingLoc rl) return new Dto.RingLoc(rl.ringIndex);
+        if (loc instanceof Dto.HomeLoc hl) return new Dto.HomeLoc(hl.laneIndex);
+        return new Dto.FinishedLoc();
+    }
+
+    public record MoveResult(Dto.PlayerState updated, boolean captured){}
+}
+
+# ---------- src/main/java/com/example/ludo/websocket/GameWsController.java ----------
+package com.example.ludo.websocket;
+
+import com.example.ludo.model.Dto;
+import com.example.ludo.model.Types;
+import com.example.ludo.service.GameService;
+import org.springframework.messaging.handler.annotation.DestinationVariable;
+import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.messaging.handler.annotation.Payload;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.stereotype.Controller;
+
+import java.security.Principal;
+import java.util.*;
+
+@Controller
+public class GameWsController {
+    private final GameService gameService; private final SimpMessagingTemplate broker;
+    public GameWsController(GameService gameService, SimpMessagingTemplate broker) { this.gameService = gameService; this.broker = broker; }
+
+    // Client publish: /app/room.{roomId}.join  (payload: { players: 2|3|4 })
+    @MessageMapping("room.{roomId}.join")
+    public void join(@DestinationVariable String roomId, @Payload Map<String,Object> payload, Principal principal) {
+        int players = Optional.ofNullable((Number)payload.getOrDefault("players", 2)).orElse(2).intValue();
+        Dto.GameState state = gameService.createOrGetRoom(roomId, players);
+        state.room = roomId;
+        Dto.NetEvent e = new Dto.NetEvent(); e.type = "SYNC"; e.state = state;
+        broker.convertAndSend("/topic/room/"+roomId, e);
+    }
+
+    // Client publish: /app/room.{roomId}.roll  (server will broadcast ROLL)
+    @MessageMapping("room.{roomId}.roll")
+    public void roll(@DestinationVariable String roomId) {
+        gameService.getRoom(roomId).ifPresent(state -> {
+            int value = new Random().nextInt(6) + 1;
+            Dto.NetEvent e = new Dto.NetEvent(); e.type = "ROLL"; e.value = value;
+            broker.convertAndSend("/topic/room/"+roomId, e);
+        });
+    }
+
+    // Client publish: /app/room.{roomId}.move  payload: { pid: "P0", tid: 1, dice: 6 }
+    @MessageMapping("room.{roomId}.move")
+    public void move(@DestinationVariable String roomId, @Payload Dto.MoveRequest move) {
+        gameService.getRoom(roomId).ifPresent(state -> {
+            if (move.pid == null || move.tid == null || move.dice == null) return;
+            gameService.tryMove(state, move.pid, move.tid, move.dice).ifPresent(res -> {
+                // apply the simulated result to real state
+                state.players.set(move.pid.ordinal(), res.updated);
+                boolean rolledSix = move.dice == 6 || res.captured;
+                Types.PlayerId current = state.current;
+                if (!rolledSix) {
+                    int idx = state.activePlayers.indexOf(current);
+                    state.current = state.activePlayers.get((idx + 1) % state.activePlayers.size());
+                }
+                state.dice = null; state.rolled = false; // UI will re-roll on client
+
+                // broadcast MOVE
+                Dto.NetEvent e = new Dto.NetEvent(); e.type = "MOVE"; e.pid = move.pid; e.tid = move.tid;
+                broker.convertAndSend("/topic/room/"+roomId, e);
+            });
+        });
+    }
+}
+
+# ---------- src/main/java/com/example/ludo/rest/RoomController.java ----------
+package com.example.ludo.rest;
+
+import com.example.ludo.model.Dto;
+import com.example.ludo.service.GameService;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.*;
+
+@RestController
+@RequestMapping("/api/rooms")
+public class RoomController {
+    private final GameService gameService;
+    public RoomController(GameService gameService) { this.gameService = gameService; }
+
+    @PostMapping("/{roomId}")
+    public ResponseEntity<Dto.GameState> create(@PathVariable String roomId, @RequestParam(defaultValue = "2") int players) {
+        return ResponseEntity.ok(gameService.createOrGetRoom(roomId, players));
+    }
+
+    @GetMapping("/{roomId}")
+    public ResponseEntity<Dto.GameState> get(@PathVariable String roomId) {
+        return gameService.getRoom(roomId).map(ResponseEntity::ok).orElse(ResponseEntity.notFound().build());
+    }
+}
+
+# ---------- Frontend integration (TypeScript) ----------
+// Install on RN app:
+//   npm i @stomp/stompjs
+// Update your NetProvider to STOMP-based (replace WSBus in App.tsx):
+/*
+import { Client } from "@stomp/stompjs";
+
+class STOMPBus implements NetProvider {
+  private client: Client | null = null; private room: string | null = null; private cb: ((e: NetEvent)=>void) | null = null;
+  async join(room: string, onEvent: (e: NetEvent)=>void) {
+    this.cb = onEvent; this.room = room;
+    this.client = new Client({ brokerURL: "wss://<YOUR_HOST>/ws", reconnectDelay: 3000 });
+    this.client.onConnect = () => {
+      this.client!.subscribe(`/topic/room/${room}`, (msg) => { try { const e = JSON.parse(msg.body) as NetEvent; this.cb?.(e); } catch {} });
+      // tell server you joined (also initializes room)
+      this.client!.publish({ destination: `/app/room.${room}.join`, body: JSON.stringify({ players: 2 }) });
+    };
+    this.client.activate();
+  }
+  send(e: NetEvent) {
+    if (!this.client || !this.room) return;
+    if (e.type === 'ROLL' && e.value!=null) this.client.publish({ destination: `/app/room.${this.room}.roll`, body: '{}' });
+    else if (e.type === 'MOVE' && e.pid!=null && e.tid!=null) this.client.publish({ destination: `/app/room.${this.room}.move`, body: JSON.stringify({ pid: e.pid, tid: e.tid, dice:  (window as any).__lastDice || 1 }) });
+  }
+  leave() { this.client?.deactivate(); this.client = null; this.cb = null; this.room = null; }
+}
+// Then in makeNet(): return new STOMPBus();
+// Also, in roll() after computing value, set (window as any).__lastDice = value; so server can validate your move.
+*/
+
+# ---------- Quick Start ----------
+# 1) Build & run
+#    mvn spring-boot:run
+#    Server: http://localhost:8080, WS endpoint: ws://localhost:8080/ws
+# 2) (Optional) create a room via REST
+#    curl -X POST "http://localhost:8080/api/rooms/room123?players=2"
+# 3) In the RN app, switch to Online, enter roomId (e.g., room123), and use the STOMPBus client.
+
+# ---------- Notes ----------
+# • This backend keeps state in-memory; restart loses rooms. For production, plug in Redis and persist state.
+# • Security is intentionally open (CORS *). Tighten origins and consider JWT auth for real users.
+# • Game rules mirror the frontend: 6 grants extra turn, 3×6 cap handled on client; you can enforce on server if desired.
+# • The move endpoint applies minimal validation; extend to full authoritative validation if you want anti-cheat.
